@@ -1,160 +1,123 @@
-from flask import Flask, request, jsonify, send_file
-import boto3, uuid, datetime, io
+const express = require("express")
+const AWS = require("aws-sdk")
+const multer = require("multer")
+const fs = require("fs")
+const path = require("path")
 
-app = Flask(__name__)
+// Configure AWS SDK
+AWS.config.update({ region: "ap-northeast-1" })
+const s3 = new AWS.S3()
+const dynamoDB = new AWS.DynamoDB.DocumentClient({ apiVersion: "2012-08-10" })
 
-# Cấu hình AWS
-S3_BUCKET = 'tramy-example'
-DYNAMODB_TABLE = 'common-dynamodb'
-SNS_TOPIC_ARN = 'arn:aws:sns:ap-northeast-1:007730611294:tramy-upload'
+const app = express()
+const upload = multer({ dest: "uploads/" })
+const PORT = process.env.PORT || 80
 
-s3 = boto3.client('s3')
-dynamodb = boto3.resource('dynamodb')
-sns = boto3.client('sns')
-table = dynamodb.Table(DYNAMODB_TABLE)
+const S3_BUCKET = "tramy-example"
+const DYNAMODB_TABLE = "common-dynamodb"
 
-# Upload file
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+// Serve static files from public directory
+app.use(express.static("public"))
 
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+// Feature 1: Upload file to S3 and save metadata to DynamoDB
+app.post("/upload", upload.single("file"), (req, res) => {
+  const file = req.file
+  if (!file) {
+    return res.status(400).send("No file uploaded.")
+  }
+  const s3Key = file.originalname // S3 key (filename in S3)
 
-    file_id = str(uuid.uuid4())
-    s3_key = f"uploads/{file_id}_{file.filename}"
-    s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=file)
+  const fileStream = fs.createReadStream(file.path)
+  const s3Params = {
+    Bucket: S3_BUCKET,
+    Key: s3Key,
+    Body: fileStream,
+  }
+  console.log("Uploaded file s3Params: ", {
+    Bucket: s3Params.Bucket,
+    Key: s3Params.Key,
+  })
 
-    item = {
-        'FileId': file_id,
-        'Filename': file.filename,
-        'S3Key': s3_key,
-        'UploadedAt': datetime.datetime.utcnow().isoformat()
+  s3.upload(s3Params, (err, data) => {
+    if (err) {
+      return res.status(500).send("Error uploading file to S3")
     }
-    table.put_item(Item=item)
 
-    sns.publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Message=f"New file uploaded: {file.filename} (ID: {file_id})",
-        Subject="File Upload Notification"
-    )
+    const s3Uri = `s3://${S3_BUCKET}/${s3Key}` // Construct the S3 URI
+    const metadata = {
+      TableName: DYNAMODB_TABLE,
+      Item: {
+        key: file.originalname, // 'key' is used as the primary key attribute
+        filename: file.originalname, // Adding the filename attribute
+        uploadTime: new Date().toISOString(),
+        s3Uri: s3Uri,
+      },
+    }
 
-    return jsonify({'message': 'File uploaded successfully', 'FileId': file_id})
+    console.log("Uploaded file metadata(DynamoDB): ", metadata)
+    dynamoDB.put(metadata, (err) => {
+      if (err) {
+        console.log("Failed to put to DynamoDB with err: ", err)
+        return res.status(500).send("Error saving metadata to DynamoDB")
+      }
 
-# List files
-@app.route('/files', methods=['GET'])
-def list_files():
-    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix='uploads/')
-    files = []
-    if 'Contents' in response:
-        for obj in response['Contents']:
-            files.append(obj['Key'])
-    return jsonify({'files': files})
+      fs.unlinkSync(file.path) // Remove the file from the server after upload
+      res.status(200).send("File uploaded and metadata saved.")
+    })
+  })
+})
 
-# Download file
-@app.route('/download', methods=['GET'])
-def download_file():
-    file_key = request.args.get('file_key')
-    if not file_key:
-        return jsonify({'error': 'Missing file_key parameter'}), 400
+// Feature 2: Get all files metadata
+app.get("/getfilesfromdb", (req, res) => {
+  const scanParams = {
+    TableName: DYNAMODB_TABLE,
+    ProjectionExpression: "filename",
+  }
 
-    try:
-        s3_response = s3.get_object(Bucket=S3_BUCKET, Key=file_key)
-        file_stream = s3_response['Body'].read()
+  dynamoDB.scan(scanParams, (err, data) => {
+    if (err) {
+      console.log("Failed to scan DynamoDB: ", err)
+      return res
+        .status(500)
+        .send("Error retrieving file metadata from DynamoDB.")
+    }
 
-        return send_file(
-            io.BytesIO(file_stream),
-            download_name=file_key.split('/')[-1],
-            as_attachment=True
-        )
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    const fileNames = data.Items.map((item) => item.filename)
+    res.json(fileNames)
+  })
+})
 
-# Show file content (text files)
-@app.route('/show', methods=['GET'])
-def show_file_content():
-    file_key = request.args.get('file_key')
-    if not file_key:
-        return jsonify({'error': 'Missing file_key parameter'}), 400
+// Feature 3: Get file content by filename
+app.get("/file-content/:fileName", (req, res) => {
+  const fileName = req.params.fileName
 
-    try:
-        s3_response = s3.get_object(Bucket=S3_BUCKET, Key=file_key)
-        file_stream = s3_response['Body'].read()
-        content = file_stream.decode('utf-8')  # Giả sử file text
+  const searchParams = {
+    TableName: DYNAMODB_TABLE,
+    Key: {
+      key: fileName,
+    },
+  }
 
-        return jsonify({'file_key': file_key, 'content': content})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+  dynamoDB.get(searchParams, (err, data) => {
+    if (err || !data.Item) {
+      return res.status(404).send("File not found.")
+    }
 
-# Trang index hiển thị danh sách file và nút Download/Show
-@app.route('/')
-def index():
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>File List</title>
-    </head>
-    <body>
-        <h1>File List</h1>
-        <div id="file-list"></div>
-        <pre id="file-content" style="white-space: pre-wrap; border:1px solid #ccc; padding:10px; margin-top:20px;"></pre>
+    const s3Params = {
+      Bucket: S3_BUCKET,
+      Key: data.Item.s3Uri.split("/").pop(),
+    }
 
-        <script>
-        async function fetchFiles() {
-            const res = await fetch('/files');
-            const data = await res.json();
-            const fileListDiv = document.getElementById('file-list');
-            fileListDiv.innerHTML = '';
+    s3.getObject(s3Params, (err, fileData) => {
+      if (err) {
+        return res.status(500).send("Error downloading file from S3")
+      }
 
-            data.files.forEach(fileKey => {
-                const div = document.createElement('div');
-                div.style.marginBottom = '10px';
+      res.send(fileData.Body.toString("utf-8"))
+    })
+  })
+})
 
-                const fileName = fileKey.split('/').pop();
-
-                const span = document.createElement('span');
-                span.textContent = fileName + ' ';
-
-                // nút download
-                const btnDownload = document.createElement('button');
-                btnDownload.textContent = 'Download';
-                btnDownload.onclick = () => {
-                    window.location.href = `/download?file_key=${encodeURIComponent(fileKey)}`;
-                };
-
-                // nút show
-                const btnShow = document.createElement('button');
-                btnShow.textContent = 'Show';
-                btnShow.onclick = async () => {
-                    const resShow = await fetch(`/show?file_key=${encodeURIComponent(fileKey)}`);
-                    if(resShow.ok) {
-                        const dataShow = await resShow.json();
-                        if(dataShow.content) {
-                            document.getElementById('file-content').textContent = `Content of ${fileName}:\n\n` + dataShow.content;
-                        } else {
-                            document.getElementById('file-content').textContent = 'No content available or binary file.';
-                        }
-                    } else {
-                        document.getElementById('file-content').textContent = 'Error fetching file content.';
-                    }
-                };
-
-                div.appendChild(span);
-                div.appendChild(btnDownload);
-                div.appendChild(btnShow);
-
-                fileListDiv.appendChild(div);
-            });
-        }
-
-        fetchFiles();
-        </script>
-    </body>
-    </html>
-    '''
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
+})
